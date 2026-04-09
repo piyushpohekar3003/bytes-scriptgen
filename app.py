@@ -48,11 +48,22 @@ def fetch_url(url: str, timeout: int = 8) -> str:
 
 
 def clean_html(html: str) -> str:
-    text = re.sub(r"<a[^>]*>(.*?)</a>", r"\1", html, flags=re.DOTALL)
+    if not html:
+        return ""
+    # Remove URLs (raw or in href attributes)
+    text = re.sub(r'href="[^"]*"', '', html)
+    text = re.sub(r'https?://\S+', '', text)
+    # Remove anchor tags but keep inner text
+    text = re.sub(r"<a[^>]*>(.*?)</a>", r"\1", text, flags=re.DOTALL)
+    # Remove all remaining HTML tags
     text = re.sub(r"<[^>]+>", " ", text)
+    # Remove HTML entities
     text = unescape(text)
+    # Remove any leftover tag fragments
+    text = re.sub(r'[<>]', '', text)
+    # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
-    return text[:300]
+    return text[:250]
 
 
 def extract_cdata(xml_str: str, tag: str) -> str:
