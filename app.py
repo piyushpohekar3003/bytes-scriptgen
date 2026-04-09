@@ -50,19 +50,30 @@ def fetch_url(url: str, timeout: int = 8) -> str:
 def clean_html(html: str) -> str:
     if not html:
         return ""
-    # Remove URLs (raw or in href attributes)
-    text = re.sub(r'href="[^"]*"', '', html)
-    text = re.sub(r'https?://\S+', '', text)
-    # Remove anchor tags but keep inner text
-    text = re.sub(r"<a[^>]*>(.*?)</a>", r"\1", text, flags=re.DOTALL)
-    # Remove all remaining HTML tags
-    text = re.sub(r"<[^>]+>", " ", text)
-    # Remove HTML entities
+    # Step 1: Remove complete <a> tags but keep inner text
+    text = re.sub(r'<a\s[^>]*>(.*?)</a>', r'\1', html, flags=re.DOTALL | re.IGNORECASE)
+    # Step 2: Remove <font> tags but keep inner text
+    text = re.sub(r'<font\s[^>]*>(.*?)</font>', r'\1', text, flags=re.DOTALL | re.IGNORECASE)
+    # Step 3: Remove ALL remaining HTML tags (including self-closing, broken, partial)
+    text = re.sub(r'<[^>]*>', ' ', text)
+    # Step 4: Remove broken tag fragments like 'a target="_blank"', 'font color="..."'
+    text = re.sub(r'\ba\s+target="[^"]*"', '', text)
+    text = re.sub(r'\bfont\s+color="[^"]*"', '', text)
+    text = re.sub(r'\btarget="[^"]*"', '', text)
+    text = re.sub(r'\bhref="[^"]*"', '', text)
+    # Step 5: Remove HTML entities
+    text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    text = re.sub(r'&[a-zA-Z]+;', ' ', text)
+    text = re.sub(r'&#\d+;', ' ', text)
     text = unescape(text)
-    # Remove any leftover tag fragments
+    # Step 6: Remove raw URLs
+    text = re.sub(r'https?://\S+', '', text)
+    # Step 7: Remove any leftover angle brackets or tag-like junk
     text = re.sub(r'[<>]', '', text)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r'/font\b', '', text)
+    text = re.sub(r'/a\b', '', text)
+    # Step 8: Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
     return text[:250]
 
 
