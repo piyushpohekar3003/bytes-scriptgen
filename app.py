@@ -250,6 +250,20 @@ def run_visuals_and_pdf(job: PipelineJob):
         update_step(job, "storyboard_pdf", status="failed", message="Skipped due to earlier error")
 
 
+def _is_voice_error(err: Any) -> bool:
+    """Detect voice-compat errors in HeyGen poll responses (dict or str)."""
+    voice_codes = ("VOICE_SETTINGS_NOT_SUPPORTED", "VOICE_NOT_FOUND", "INVALID_VOICE_ID")
+    if isinstance(err, dict):
+        code = str(err.get("code") or "")
+        msg = str(err.get("message") or "")
+        if code in voice_codes:
+            return True
+        blob = (code + " " + msg).lower()
+    else:
+        blob = str(err or "").lower()
+    return "voice" in blob and ("not support" in blob or "not_support" in blob or "invalid" in blob or "not found" in blob)
+
+
 def run_heygen(job: PipelineJob):
     """Thread 2: submit to HeyGen → poll → download."""
     try:
@@ -279,6 +293,8 @@ def run_heygen(job: PipelineJob):
 
         start = time.time()
         max_wait = 20 * 60  # 20 minutes
+        voice_retry_used = False
+        current_voice_id = job.voice_id
         while True:
             elapsed = time.time() - start
             if elapsed > max_wait:
@@ -308,7 +324,32 @@ def run_heygen(job: PipelineJob):
                 return
 
             if status == "failed":
-                raise RuntimeError(f"HeyGen failed: {info.get('error', 'unknown error')}")
+                err = info.get("error", "unknown error")
+                # If it's a voice-compat error and we haven't retried yet, re-submit with fallback voice.
+                # This handles errors that only surface after submit succeeds (e.g.
+                # TemporalCoreActivity.COMPLETE_SCRIPT_METADATA / VOICE_SETTINGS_NOT_SUPPORTED).
+                if (
+                    not voice_retry_used
+                    and fallback_voice_id
+                    and fallback_voice_id != current_voice_id
+                    and _is_voice_error(err)
+                ):
+                    voice_retry_used = True
+                    print(f"[Pipeline {job.id}] Voice {current_voice_id} failed during HeyGen processing ({err}); re-submitting with avatar default voice {fallback_voice_id}")
+                    update_step(job, "heygen_poll", progress=5, ended_at=None,
+                                message=f"Voice incompatible, retrying with avatar default...")
+                    # Re-submit with the fallback voice only (no further fallback)
+                    video_id = hg.submit_video(
+                        job.script, job.avatar_id, fallback_voice_id,
+                        fallback_voice_id=None,
+                    )
+                    job.heygen_video_id = video_id
+                    current_voice_id = fallback_voice_id
+                    start = time.time()  # reset poll clock
+                    time.sleep(5)
+                    continue
+
+                raise RuntimeError(f"HeyGen failed: {err}")
 
             time.sleep(15)
     except Exception as e:
@@ -731,8 +772,34 @@ def get_heygen_avatars():
 
 @app.route("/api/heygen/voices")
 def get_heygen_voices():
+    """
+    Return voices from HeyGen. If the HEYGEN_VOICE_IDS env var is set
+    (comma-separated voice IDs), only those voices are returned — this is the
+    recommended way to restrict the picker to your custom/cloned voices, since
+    HeyGen's /v2/voices endpoint does not distinguish stock vs. custom voices.
+    """
     try:
         voices = hg.list_voices()
+
+        # Optional whitelist from env (e.g. Railway Variables)
+        whitelist_env = os.environ.get("HEYGEN_VOICE_IDS", "").strip()
+        whitelist = {v.strip() for v in whitelist_env.split(",") if v.strip()} if whitelist_env else None
+
+        # Also include the default_voice_ids from the user's custom avatar groups
+        # so the user always has at least their own avatar voices available.
+        avatar_default_voice_ids: set = set()
+        try:
+            for a in hg.list_avatars():
+                vid = a.get("default_voice_id")
+                if vid:
+                    avatar_default_voice_ids.add(vid)
+        except Exception:
+            pass
+
+        if whitelist is not None:
+            allowed = whitelist | avatar_default_voice_ids
+            voices = [v for v in voices if v.get("voice_id") in allowed]
+
         simplified = [
             {
                 "voice_id": v.get("voice_id"),
@@ -744,7 +811,7 @@ def get_heygen_voices():
             for v in voices
             if v.get("voice_id")
         ]
-        return jsonify({"voices": simplified})
+        return jsonify({"voices": simplified, "total": len(simplified), "filtered": whitelist is not None})
     except Exception as e:
         return jsonify({"error": str(e), "voices": []}), 500
 
