@@ -1,5 +1,5 @@
 """
-Bytes ScriptGen — Python Backend
+Bytes Automation — Python Backend
 Flask server that serves the React frontend + API endpoints.
 Now supports the A1 Bytes framework (5 categories) + HeyGen video pipeline.
 """
@@ -894,7 +894,7 @@ def serve_spa(path):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
-    print(f"\n  Bytes ScriptGen running at http://localhost:{port}")
+    print(f"\n  Bytes Automation running at http://localhost:{port}")
     print(f"  Open this URL in your browser\n")
     try:
         import webbrowser

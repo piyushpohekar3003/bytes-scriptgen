@@ -1,13 +1,13 @@
 #!/bin/bash
 # ═══════════════════════════════════════════
-#  Bytes ScriptGen — Double-click to run!
+#  Bytes Automation — Double-click to run!
 # ═══════════════════════════════════════════
 
 cd "$(dirname "$0")"
 
 echo ""
 echo "  ┌─────────────────────────────────┐"
-echo "  │   Bytes ScriptGen              │"
+echo "  │   Bytes Automation              │"
 echo "  │   Starting up...                │"
 echo "  └─────────────────────────────────┘"
 echo ""

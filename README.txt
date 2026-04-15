@@ -1,5 +1,5 @@
 ╔═══════════════════════════════════════════╗
-║         BYTES SCRIPTGEN                   ║
+║         BYTES AUTOMATION                  ║
 ║   AI-powered finance news scripts         ║
 ╚═══════════════════════════════════════════╝
 
