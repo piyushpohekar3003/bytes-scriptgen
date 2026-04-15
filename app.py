@@ -13,7 +13,7 @@ import threading
 from html import unescape
 from urllib.parse import quote, urlparse
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 
 from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
@@ -770,35 +770,94 @@ def get_heygen_avatars():
         return jsonify({"error": str(e), "avatars": []}), 500
 
 
+def _first_name_token(avatar_name: str) -> Optional[str]:
+    """
+    Extract the first human-name token from an avatar name.
+    Examples:
+      "Sanika - Professional"  -> "sanika"
+      "Sanika_Casual"          -> "sanika"
+      "Piyush (Studio)"        -> "piyush"
+      "  Rahul-v2 "            -> "rahul"
+    Returns lowercased token, or None if nothing reasonable is found.
+    """
+    import re
+    if not avatar_name:
+        return None
+    # Split on non-letter chars, take first non-empty alphabetic token of length >= 3
+    for part in re.split(r"[^A-Za-z]+", avatar_name):
+        if len(part) >= 3:
+            return part.lower()
+    return None
+
+
 @app.route("/api/heygen/voices")
 def get_heygen_voices():
     """
-    Return voices from HeyGen. If the HEYGEN_VOICE_IDS env var is set
-    (comma-separated voice IDs), only those voices are returned — this is the
-    recommended way to restrict the picker to your custom/cloned voices, since
-    HeyGen's /v2/voices endpoint does not distinguish stock vs. custom voices.
+    Return voices from HeyGen with smart filtering:
+
+      1. If HEYGEN_VOICE_IDS env var is set (comma-separated voice IDs),
+         those voices are always included.
+      2. Each user custom avatar's default_voice_id is always included.
+      3. If ?avatar_id=<id> is provided, only voices whose name contains the
+         first-name token of THAT avatar are included (plus that avatar's
+         default_voice_id).
+      4. Otherwise (no avatar_id), voices whose name contains ANY first-name
+         token from ANY of the user's custom avatars are included.
+         E.g. if the user has avatars "Sanika - Professional" and "Rahul",
+         voices named "Sanika - Calm", "Rahul - Narrator", etc. are kept.
+
+    This exploits the convention that cloned voices share the first name of the
+    cloned avatar — reducing HeyGen's 2000+ voice catalog to a few relevant
+    voices without any whitelist config.
+
+    Query params:
+      avatar_id: (optional) narrow to voices matching only that avatar's name
     """
     try:
         voices = hg.list_voices()
+        avatar_id_q = (request.args.get("avatar_id") or "").strip()
 
-        # Optional whitelist from env (e.g. Railway Variables)
-        whitelist_env = os.environ.get("HEYGEN_VOICE_IDS", "").strip()
-        whitelist = {v.strip() for v in whitelist_env.split(",") if v.strip()} if whitelist_env else None
-
-        # Also include the default_voice_ids from the user's custom avatar groups
-        # so the user always has at least their own avatar voices available.
-        avatar_default_voice_ids: set = set()
+        # Pull custom avatars once for both filter and default_voice_id inclusion
         try:
-            for a in hg.list_avatars():
-                vid = a.get("default_voice_id")
-                if vid:
-                    avatar_default_voice_ids.add(vid)
+            avatars = hg.list_avatars()
         except Exception:
-            pass
+            avatars = []
 
-        if whitelist is not None:
-            allowed = whitelist | avatar_default_voice_ids
-            voices = [v for v in voices if v.get("voice_id") in allowed]
+        # Tokens to match voice names against
+        if avatar_id_q:
+            tokens: set = set()
+            target_default_voice: Optional[str] = None
+            for a in avatars:
+                if a.get("avatar_id") == avatar_id_q:
+                    t = _first_name_token(a.get("avatar_name") or "")
+                    if t:
+                        tokens.add(t)
+                    target_default_voice = a.get("default_voice_id")
+                    break
+            avatar_default_voice_ids = {target_default_voice} if target_default_voice else set()
+        else:
+            tokens = {t for a in avatars if (t := _first_name_token(a.get("avatar_name") or ""))}
+            avatar_default_voice_ids = {a.get("default_voice_id") for a in avatars if a.get("default_voice_id")}
+
+        # Optional explicit whitelist from env (Railway Variables)
+        whitelist_env = os.environ.get("HEYGEN_VOICE_IDS", "").strip()
+        whitelist = {v.strip() for v in whitelist_env.split(",") if v.strip()} if whitelist_env else set()
+
+        always_include = whitelist | avatar_default_voice_ids
+
+        def keep(v: Dict[str, Any]) -> bool:
+            vid = v.get("voice_id")
+            if not vid:
+                return False
+            if vid in always_include:
+                return True
+            name = (v.get("name") or "").lower()
+            return any(t in name for t in tokens)
+
+        # Only apply filter if we have something to filter by — otherwise return
+        # everything (keeps the endpoint usable in a fresh account with no avatars).
+        applied_filter = bool(tokens or always_include)
+        filtered = [v for v in voices if keep(v)] if applied_filter else voices
 
         simplified = [
             {
@@ -808,10 +867,15 @@ def get_heygen_voices():
                 "gender": v.get("gender"),
                 "preview_audio": v.get("preview_audio"),
             }
-            for v in voices
+            for v in filtered
             if v.get("voice_id")
         ]
-        return jsonify({"voices": simplified, "total": len(simplified), "filtered": whitelist is not None})
+        return jsonify({
+            "voices": simplified,
+            "total": len(simplified),
+            "filtered": applied_filter,
+            "matched_tokens": sorted(tokens),
+        })
     except Exception as e:
         return jsonify({"error": str(e), "voices": []}), 500
 
