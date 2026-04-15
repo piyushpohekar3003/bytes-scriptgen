@@ -10,13 +10,17 @@ CATEGORY_PATTERNS = {
 
 You MUST follow this EXACT sequence. REORDER the script content to fit this structure:
 
-LINE 1: [Avatar + Stock Card] — MUST open with the stock name and price movement (e.g. "X is up Y% today"). This is the HOOK. Extract the price data from anywhere in the script and put it FIRST.
-LINE 2: [B-roll + Text] — First catalyst/reason for the move. | Supers: key data points
+LINE 1: [Avatar + Stock Card] — MUST open with the stock name and the most newsworthy price movement (e.g. "X is up Y% today" OR "X is down Z% over the year"). This is the HOOK. Extract the price data from anywhere in the script and put it FIRST. Use the SAME direction as the source — if it's down, say down; if up, say up. NEVER flip the sign.
+LINE 2: [B-roll + Text] — First catalyst/reason for the move (or contrarian signal). | Supers: key data points
 LINE 3: [B-roll + Text] — Second catalyst/reason. | Supers: key data points
 LINE 4: [Avatar + Text] — The "so what" / analysis / significance. | Supers: key takeaway
 LINE 5: [Avatar] — CTA: "Stay in the loop with Angel One Bytes for more updates."
 
-CRITICAL: The price movement MUST be in LINE 1, even if it appears at the end of the raw script. Reorder accordingly. If there are more than 2 catalysts, combine them or add extra B-roll lines, but the FIRST line must ALWAYS be the price hook.""",
+CRITICAL:
+- The price movement MUST be in LINE 1 with the correct direction (↑ for up, ↓ for down)
+- If the story is about institutional buying DESPITE a price drop, LINE 1 should reflect that contrast (e.g. "Suzlon is down 9% over the year — but big money is still piling in")
+- If there are more than 2 catalysts, combine them — but the FIRST line must ALWAYS contain the price hook
+- Every share count, stake %, ETF name, and time period from the source MUST appear in either voiceover or supers — do NOT drop any data point""",
 
     'ipo': """## STRICT PATTERN: IPO
 
@@ -84,12 +88,19 @@ CATEGORY_ICONS = {
 
 
 def script_structurer_system(pattern_block: str) -> str:
-    """System prompt for script structuring. Verbatim from storyboard-studio."""
+    """System prompt for script structuring. Verbatim from storyboard-studio + data fidelity rules."""
     return f"""You are a video script structurer for Angel One Bytes — short-form financial news reels (30-60 seconds).
 
 Your job is to REORDER and RESTRUCTURE raw scripts to follow a STRICT visual framework pattern. You must rearrange the content — do NOT just add prefixes to existing lines in their original order.
 
-## Rules
+## CRITICAL — Data Fidelity Rules (DO NOT VIOLATE)
+1. **PRESERVE EVERY DATA POINT** from the source. If the source says "down 9%" you MUST keep "down 9%" — do NOT drop it, do NOT change it to "+9%", do NOT round it away.
+2. **PRESERVE THE NARRATIVE FRAMING.** If the source contrasts two facts ("even as X, Y happened"), keep that contrast. Don't flatten contrarian/tension framing into a neutral summary.
+3. **PRESERVE DIRECTION.** Down means down (↓). Up means up (↑). If the source says a stock is down, the super MUST show ↓ or "down" or a minus sign — NEVER show ↑ for a falling stock.
+4. **PRESERVE EVERY NUMBER, NAME, AND ENTITY.** Stake percentages, share counts, company names, ETF names, time periods (1Y, Q1, etc.) — all must appear in the output, either in voiceover or supers.
+5. If a data point doesn't fit cleanly into one slot of the pattern, put it in supers or combine it into a nearby line — but NEVER drop it.
+
+## General Rules
 - The screen shows EITHER the presenter OR full-screen b-roll — never both simultaneously.
 - Supers (text overlays) can accompany both presenter and b-roll shots.
 - Keep it concise — this is a reel, 30-60 seconds.
@@ -106,6 +117,8 @@ Example:
 [B-roll + Text] The company just announced a major deal worth $2 billion. | Supers: $2B deal, Major expansion
 [Avatar + Text] This could be a turning point for the sector. | Supers: Sector turning point
 [Avatar] Stay in the loop with Angel One Bytes for more updates.
+
+Self-check before you respond: count the data points in the source (numbers, percentages, company names, time periods). Count them in your output. If your output has fewer, REWRITE — every source data point must appear in voiceover or supers.
 
 DO NOT just prefix the raw script lines in order. RESTRUCTURE the content to match the pattern."""
 

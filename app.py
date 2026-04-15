@@ -469,11 +469,39 @@ Topics:
 # ROUTES — Manual Input
 # ══════════════════════════════════════
 
+def _looks_like_garbage(text: str) -> bool:
+    """Detect cookie banners, paywall messages, bot challenges, etc."""
+    if not text or len(text) < 100:
+        return True
+    lower = text.lower()
+    garbage_signals = [
+        "cookie policy", "privacy policy", "we use cookies", "accept all cookies",
+        "subscribe to continue", "subscribe now", "premium content",
+        "please enable javascript", "javascript is disabled", "enable cookies",
+        "you have been blocked", "verify you are human", "are you a robot",
+        "this content is for subscribers", "to read this story",
+        "cloudflare", "captcha", "access denied",
+    ]
+    hits = sum(1 for sig in garbage_signals if sig in lower)
+    # If 2+ garbage signals OR the text is mostly boilerplate, treat as garbage
+    if hits >= 2:
+        return True
+    # Check if text is mostly cookie/policy noise (>30% of total length)
+    noise_chars = sum(len(sig) for sig in garbage_signals if sig in lower)
+    if noise_chars > len(text) * 0.15:
+        return True
+    return False
+
+
 @app.route("/api/manual-input", methods=["POST"])
 def manual_input():
     """
     Accept manual article input: URL + optional fallback text.
-    Returns a normalized topic object ready for script generation.
+
+    Strategy (prefer the user's input):
+      1. If fallback text is substantial (>100 chars), USE IT directly — it's the truth source
+      2. Otherwise try URL extraction
+      3. If URL returns garbage (cookie banner / paywall), fall back to user text again
     """
     data = request.json or {}
     article_url = (data.get("articleUrl") or "").strip()
@@ -483,27 +511,42 @@ def manual_input():
     article_text = ""
     resolved_title = article_title
 
-    # Try URL extraction first
+    # PRIORITY 1: If user provided substantial fallback text, USE IT.
+    # User-provided text is always more reliable than scraped HTML.
+    if fallback_text and len(fallback_text) >= 100:
+        article_text = fallback_text
+
+    # PRIORITY 2: Try URL extraction (only as supplement or if no fallback)
     if article_url:
-        extracted = extract_article_text(article_url)
-        if extracted and len(extracted) > 200:
-            article_text = extracted
+        try:
+            extracted = extract_article_text(article_url)
+            # Only use URL extract if it looks legit (not cookie/paywall garbage)
+            if extracted and len(extracted) > 200 and not _looks_like_garbage(extracted):
+                # If we don't have fallback, use URL text
+                # If we have fallback, prefer it (skip URL text)
+                if not article_text:
+                    article_text = extracted
+            # Try to grab title from page <title> (only used if user didn't supply one)
             if not resolved_title:
-                # Try to grab title from page <title>
                 html = fetch_url(article_url, timeout=8)
                 tm = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
                 if tm:
-                    resolved_title = clean_html(tm.group(1))[:200]
+                    title_candidate = clean_html(tm.group(1))[:200]
+                    if title_candidate and not _looks_like_garbage(title_candidate):
+                        resolved_title = title_candidate
+        except Exception as e:
+            print(f"[manual-input] URL extraction failed: {e}")
 
-    # Fall back to user-provided text
-    if len(article_text) < 200 and fallback_text:
-        article_text = fallback_text
-
+    # PRIORITY 3: Last resort — if still nothing useful, error
     if not article_text:
-        return jsonify({"error": "Could not extract article content. Provide fallback text."}), 400
+        return jsonify({
+            "error": "Could not extract article content. Please paste the article body in the 'Fallback content' field."
+        }), 400
 
     if not resolved_title:
-        resolved_title = article_text[:80] + "..."
+        # Pull a title from the first sentence/line of the user text
+        first_line = article_text.split("\n")[0].strip()
+        resolved_title = first_line[:120] if first_line else article_text[:80] + "..."
 
     summary = (article_text[:240] + "...") if len(article_text) > 240 else article_text
 
