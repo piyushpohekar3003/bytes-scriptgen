@@ -128,21 +128,9 @@ def strip_script_markers(script: str) -> str:
     return " ".join(lines)
 
 
-def submit_video(
-    script: str,
-    avatar_id: str,
-    voice_id: str,
-    dimension: Optional[Dict[str, int]] = None,
-) -> str:
-    """
-    Submit a video for generation. Returns video_id.
-    """
-    if dimension is None:
-        dimension = {"width": 1080, "height": 1920}  # vertical 9:16 for reels
-
+def _build_payload(script: str, avatar_id: str, voice_id: str, dimension: Dict[str, int]) -> Dict[str, Any]:
     voiceover_text = strip_script_markers(script)
-
-    payload = {
+    return {
         "video_inputs": [
             {
                 "character": {
@@ -160,23 +148,83 @@ def submit_video(
         "dimension": dimension,
     }
 
-    r = requests.post(
-        "https://api.heygen.com/v2/video/generate",
-        headers=_headers_v2(),
-        json=payload,
-        timeout=30,
-    )
-    r.raise_for_status()
-    data = r.json()
 
-    # Handle error response
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(f"HeyGen submit error: {data['error']}")
+def submit_video(
+    script: str,
+    avatar_id: str,
+    voice_id: str,
+    dimension: Optional[Dict[str, int]] = None,
+    fallback_voice_id: Optional[str] = None,
+) -> str:
+    """
+    Submit a video for generation. Returns video_id.
+    If the submit fails with a voice-related error, retries once with `fallback_voice_id`
+    (typically the avatar's default voice) before giving up.
+    """
+    if dimension is None:
+        dimension = {"width": 1080, "height": 1920}  # vertical 9:16 for reels
 
-    # Extract video_id
-    if isinstance(data, dict) and "data" in data:
-        return data["data"].get("video_id", "")
-    raise RuntimeError(f"Unexpected HeyGen response: {data}")
+    def _do_submit(use_voice: str):
+        payload = _build_payload(script, avatar_id, use_voice, dimension)
+        r = requests.post(
+            "https://api.heygen.com/v2/video/generate",
+            headers=_headers_v2(),
+            json=payload,
+            timeout=30,
+        )
+        # Don't raise on 400 — we want to inspect the error body to decide whether to retry
+        try:
+            data = r.json()
+        except Exception:
+            r.raise_for_status()
+            raise RuntimeError(f"HeyGen returned non-JSON: {r.text[:200]}")
+
+        # Look for error patterns inside the response body or HTTP error
+        if r.status_code != 200:
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict):
+                code = err.get("code") or err.get("activity_name") or "unknown"
+                msg = err.get("message") or str(err)
+            else:
+                code = "HTTP_" + str(r.status_code)
+                msg = str(err or data)[:200]
+            return None, code, msg
+
+        # 200 but error field set
+        if isinstance(data, dict) and data.get("error"):
+            err = data.get("error")
+            if isinstance(err, dict):
+                code = err.get("code") or "unknown"
+                msg = err.get("message") or str(err)
+            else:
+                code = "unknown"
+                msg = str(err)
+            return None, code, msg
+
+        if isinstance(data, dict) and "data" in data:
+            return data["data"].get("video_id", ""), None, None
+
+        return None, "unexpected_response", str(data)[:200]
+
+    # First attempt with user-selected voice
+    video_id, err_code, err_msg = _do_submit(voice_id)
+    if video_id:
+        return video_id
+
+    # Retry with fallback voice if it's a voice-compatibility issue
+    voice_errors = {"VOICE_SETTINGS_NOT_SUPPORTED", "VOICE_NOT_FOUND", "INVALID_VOICE_ID"}
+    if (
+        fallback_voice_id
+        and fallback_voice_id != voice_id
+        and (err_code in voice_errors or "voice" in (err_msg or "").lower())
+    ):
+        print(f"[heygen] Voice {voice_id} failed ({err_code}), retrying with avatar default voice {fallback_voice_id}")
+        video_id, err_code2, err_msg2 = _do_submit(fallback_voice_id)
+        if video_id:
+            return video_id
+        raise RuntimeError(f"HeyGen submit failed even with fallback voice. {err_code2}: {err_msg2}")
+
+    raise RuntimeError(f"HeyGen submit failed. {err_code}: {err_msg}")
 
 
 # ──────────────────────────────────────────────────────────────────────

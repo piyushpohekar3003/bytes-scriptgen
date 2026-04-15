@@ -253,10 +253,22 @@ def run_visuals_and_pdf(job: PipelineJob):
 def run_heygen(job: PipelineJob):
     """Thread 2: submit to HeyGen → poll → download."""
     try:
-        # Step: heygen_submit
+        # Step: heygen_submit — auto-fallback to avatar's default voice if user voice is incompatible
         update_step(job, "heygen_submit", status="running", started_at=time.time(), progress=20,
                     message="Submitting script to HeyGen...")
-        video_id = hg.submit_video(job.script, job.avatar_id, job.voice_id)
+        # Look up the avatar's default voice as a safety fallback
+        fallback_voice_id = None
+        try:
+            for a in hg.list_avatars():
+                if a.get("avatar_id") == job.avatar_id:
+                    fallback_voice_id = a.get("default_voice_id")
+                    break
+        except Exception:
+            pass
+        video_id = hg.submit_video(
+            job.script, job.avatar_id, job.voice_id,
+            fallback_voice_id=fallback_voice_id,
+        )
         job.heygen_video_id = video_id
         update_step(job, "heygen_submit", status="done", progress=100, ended_at=time.time(),
                     message=f"Submitted (video_id: {video_id[:10]}...)")
@@ -587,11 +599,15 @@ def manual_input():
 def generate_scripts():
     """
     Generate structured A1 Bytes scripts for 1-5 topics.
-    Request: {topics: [...], category?: string}  (category=null → auto-detect per topic)
+    Request: {topics: [...], category?: string, skipFormatting?: bool}
+      - category=null → auto-detect per topic
+      - skipFormatting=true → use the user's article text as-is, no LLM restructuring
+                              (useful when the user already wrote a polished script)
     """
     data = request.json or {}
     topics_list = data.get("topics", [])
     forced_category = data.get("category")  # null/undefined = auto-detect
+    skip_formatting = bool(data.get("skipFormatting"))
 
     if not topics_list:
         return jsonify({"error": "topics are required"}), 400
@@ -612,14 +628,26 @@ def generate_scripts():
                 print(f"[scripts] detect_category failed: {e}")
                 category = "stock"
 
-        # Compose the "raw script" the structurer wants: title + article text
-        raw_input = f"Headline: {article_title}\n\n{article_text}"
-
-        try:
-            structured = sb.structure_script(raw_input, category)
-        except Exception as e:
-            print(f"[scripts] structure_script error: {e}")
-            structured = f"[Avatar] Script generation failed: {e}"
+        if skip_formatting:
+            # Use the article text as-is — wrap in a single [Avatar] line so HeyGen reads it.
+            # Trim leading title if present.
+            raw = article_text.strip()
+            # Detect if the user already has tag prefixes — if so, pass through unchanged
+            if re.search(r"^\[(Avatar|B-roll)", raw, re.MULTILINE):
+                structured = raw
+            else:
+                # Wrap raw text into one Avatar block + CTA
+                structured = f"[Avatar] {raw}"
+                if "Angel One Bytes" not in raw and "Stay in the loop" not in raw:
+                    structured += "\n\n[Avatar] Stay in the loop with Angel One Bytes for more updates."
+        else:
+            # Compose the "raw script" the structurer wants: title + article text
+            raw_input = f"Headline: {article_title}\n\n{article_text}"
+            try:
+                structured = sb.structure_script(raw_input, category)
+            except Exception as e:
+                print(f"[scripts] structure_script error: {e}")
+                structured = f"[Avatar] Script generation failed: {e}"
 
         wc = len(structured.split())
         secs = round(wc / 2.5)
