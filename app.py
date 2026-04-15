@@ -30,12 +30,11 @@ DEFAULT_API_KEY = os.environ.get("ANTHROPIC_DEFAULT_KEY", "")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", DEFAULT_API_KEY)
 MODEL = "claude-sonnet-4-20250514"
 
-# Persistent storage paths (/tmp is ephemeral on Railway but fine for short-lived artifacts)
+# Persistent storage paths — only for short-lived storyboard PDFs.
+# Videos are NOT stored — we keep only the HeyGen URL and stream on download.
 STORAGE_ROOT = os.environ.get("STORAGE_ROOT", "/tmp/bytes-scriptgen")
 STORYBOARDS_DIR = os.path.join(STORAGE_ROOT, "storyboards")
-VIDEOS_DIR = os.path.join(STORAGE_ROOT, "videos")
 os.makedirs(STORYBOARDS_DIR, exist_ok=True)
-os.makedirs(VIDEOS_DIR, exist_ok=True)
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
@@ -200,7 +199,8 @@ class PipelineJob:
     status: str = "running"  # running | done | failed
     error: Optional[str] = None
     heygen_video_id: Optional[str] = None
-    artifacts: dict = field(default_factory=dict)  # {storyboard_pdf, video_mp4}
+    # artifacts: {storyboard_pdf: local path, video_url: HeyGen CDN URL, thumbnail_url, duration}
+    artifacts: dict = field(default_factory=dict)
     steps: list = field(default_factory=list)
 
 
@@ -283,13 +283,16 @@ def run_heygen(job: PipelineJob):
                         message=f"Status: {status} ({int(elapsed)}s elapsed)")
 
             if status == "completed" and video_url:
-                update_step(job, "heygen_poll", progress=95, message="Downloading video...")
-                mp4_path = os.path.join(VIDEOS_DIR, f"{job.id}.mp4")
-                hg.download_video(video_url, mp4_path)
+                # Don't download — store HeyGen's CDN URL only.
+                # User downloads directly from HeyGen via redirect.
                 with jobs_lock:
-                    job.artifacts["video_mp4"] = mp4_path
+                    job.artifacts["video_url"] = video_url
+                    if info.get("thumbnail_url"):
+                        job.artifacts["thumbnail_url"] = info.get("thumbnail_url")
+                    if info.get("duration"):
+                        job.artifacts["duration"] = info.get("duration")
                 update_step(job, "heygen_poll", status="done", progress=100, ended_at=time.time(),
-                            message="Video downloaded")
+                            message="Video ready on HeyGen")
                 return
 
             if status == "failed":
@@ -330,7 +333,9 @@ def serialize_job(job: PipelineJob) -> dict:
             "heygen_video_id": job.heygen_video_id,
             "artifacts": {
                 "storyboard_pdf": bool(job.artifacts.get("storyboard_pdf")),
-                "video_mp4": bool(job.artifacts.get("video_mp4")),
+                "video_url": job.artifacts.get("video_url"),  # HeyGen CDN URL (or null)
+                "thumbnail_url": job.artifacts.get("thumbnail_url"),
+                "duration": job.artifacts.get("duration"),
             },
             "steps": [asdict(s) for s in job.steps],
         }
@@ -632,14 +637,16 @@ def revise_script_route():
 def get_heygen_avatars():
     try:
         avatars = hg.list_avatars()
-        # Return trimmed fields
+        # Return trimmed fields (custom avatars only)
         simplified = [
             {
                 "avatar_id": a.get("avatar_id"),
                 "avatar_name": a.get("avatar_name"),
+                "group_name": a.get("group_name"),
                 "gender": a.get("gender"),
                 "preview_image_url": a.get("preview_image_url"),
                 "preview_video_url": a.get("preview_video_url"),
+                "default_voice_id": a.get("default_voice_id"),
             }
             for a in avatars
             if a.get("avatar_id")
@@ -734,6 +741,11 @@ def pipeline_status(job_id: str):
 
 @app.route("/api/pipeline/<job_id>/download/<artifact>")
 def pipeline_download(job_id: str, artifact: str):
+    """
+    Storyboard PDF — served from local /tmp (small file, generated server-side).
+    Video MP4 — redirected to HeyGen's CDN URL (we don't store videos).
+    """
+    from flask import redirect, Response, stream_with_context
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
@@ -746,10 +758,26 @@ def pipeline_download(job_id: str, artifact: str):
         return send_file(path, as_attachment=True, download_name=f"bytes-storyboard-{job_id}.pdf")
 
     if artifact == "video":
-        path = job.artifacts.get("video_mp4")
-        if not path or not os.path.exists(path):
+        video_url = job.artifacts.get("video_url")
+        if not video_url:
             return jsonify({"error": "video not ready"}), 404
-        return send_file(path, as_attachment=True, download_name=f"bytes-video-{job_id}.mp4")
+        # Stream HeyGen's video through our server with a friendly filename
+        # (so downloads have a proper name and CORS-safe).
+        try:
+            r = requests.get(video_url, stream=True, timeout=30)
+            r.raise_for_status()
+            filename = f"bytes-video-{job_id}.mp4"
+            return Response(
+                stream_with_context(r.iter_content(chunk_size=8192)),
+                mimetype="video/mp4",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": r.headers.get("Content-Length", ""),
+                },
+            )
+        except Exception as e:
+            # Fallback: just redirect to HeyGen URL if streaming fails
+            return redirect(video_url)
 
     return jsonify({"error": "unknown artifact"}), 400
 

@@ -38,20 +38,52 @@ def _cached(key: str, ttl: int, fetch_fn):
 
 
 def list_avatars() -> List[Dict[str, Any]]:
-    """Fetch all available avatars. Returns raw list."""
+    """
+    Fetch CUSTOM (private) avatars only — from the user's own avatar groups.
+    Skips HeyGen's public template library.
+    Returns flattened list of avatars across all custom groups.
+    """
     def fetch():
+        # Step 1: list all avatar groups
         r = requests.get(
-            "https://api.heygen.com/v2/avatars",
+            "https://api.heygen.com/v2/avatar_group.list",
             headers=_headers_v2(),
             timeout=15,
         )
         r.raise_for_status()
-        data = r.json()
-        # HeyGen returns {"error": null, "data": {"avatars": [...], "talking_photos": [...]}}
-        if isinstance(data, dict) and "data" in data:
-            avatars = data["data"].get("avatars", [])
-            return avatars
-        return []
+        groups_data = r.json()
+        groups = groups_data.get("data", {}).get("avatar_group_list", [])
+
+        # Filter to PRIVATE / PHOTO groups (user's custom avatars)
+        custom_groups = [g for g in groups if g.get("group_type") in ("PRIVATE", "PHOTO")]
+
+        # Step 2: for each group, fetch its avatars
+        all_avatars = []
+        for g in custom_groups:
+            group_id = g.get("id")
+            group_name = g.get("name", "Custom")
+            group_default_voice = g.get("default_voice_id")
+            try:
+                gr = requests.get(
+                    f"https://api.heygen.com/v2/avatar_group/{group_id}/avatars",
+                    headers=_headers_v2(),
+                    timeout=15,
+                )
+                if gr.status_code != 200:
+                    continue
+                avatars = gr.json().get("data", {}).get("avatar_list", [])
+                # Tag each with group info for the UI
+                for a in avatars:
+                    a["group_name"] = group_name
+                    a["group_id"] = group_id
+                    if group_default_voice and not a.get("default_voice_id"):
+                        a["default_voice_id"] = group_default_voice
+                all_avatars.extend(avatars)
+            except Exception as e:
+                print(f"[heygen] failed to fetch group {group_id}: {e}")
+                continue
+
+        return all_avatars
     return _cached("avatars", ttl=600, fetch_fn=fetch)
 
 
@@ -177,17 +209,5 @@ def poll_video(video_id: str) -> Dict[str, Any]:
     return {"status": "unknown", "error": str(data)}
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Download
-# ──────────────────────────────────────────────────────────────────────
-
-def download_video(video_url: str, dest_path: str) -> str:
-    """Download MP4 to disk. Returns path."""
-    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    with requests.get(video_url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(dest_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-    return dest_path
+# Note: We don't store videos. The HeyGen CDN URL is kept in the job log instead.
+# When the user clicks Download, the server streams it from HeyGen on-the-fly.
