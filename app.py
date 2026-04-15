@@ -1,32 +1,51 @@
 """
 Bytes ScriptGen — Python Backend
 Flask server that serves the React frontend + API endpoints.
+Now supports the A1 Bytes framework (5 categories) + HeyGen video pipeline.
 """
 import os
+import io
 import json
 import re
 import time
 import uuid
-import xml.etree.ElementTree as ET
+import threading
 from html import unescape
-from urllib.parse import urlencode, quote, urlparse
+from urllib.parse import quote, urlparse
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Any
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 import anthropic
 import requests
+
+# ── Local modules ──
+from bytes_patterns import CATEGORY_PATTERNS, CATEGORY_LABELS, CATEGORY_ICONS
+import storyboard as sb
+import heygen as hg
 
 # ── Config ──
 DEFAULT_API_KEY = os.environ.get("ANTHROPIC_DEFAULT_KEY", "")
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", DEFAULT_API_KEY)
 MODEL = "claude-sonnet-4-20250514"
 
+# Persistent storage paths (/tmp is ephemeral on Railway but fine for short-lived artifacts)
+STORAGE_ROOT = os.environ.get("STORAGE_ROOT", "/tmp/bytes-scriptgen")
+STORYBOARDS_DIR = os.path.join(STORAGE_ROOT, "storyboards")
+VIDEOS_DIR = os.path.join(STORAGE_ROOT, "videos")
+os.makedirs(STORYBOARDS_DIR, exist_ok=True)
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+
 app = Flask(__name__, static_folder="static", static_url_path="")
 CORS(app)
 
 client = anthropic.Anthropic(api_key=API_KEY)
 
-# ── Helpers ──
+
+# ══════════════════════════════════════
+# Helpers
+# ══════════════════════════════════════
 
 def call_claude(prompt: str, max_tokens: int = 1024) -> str:
     resp = client.messages.create(
@@ -50,31 +69,25 @@ def fetch_url(url: str, timeout: int = 8) -> str:
 def clean_html(html: str) -> str:
     if not html:
         return ""
-    # Step 1: Remove complete <a> tags but keep inner text
     text = re.sub(r'<a\s[^>]*>(.*?)</a>', r'\1', html, flags=re.DOTALL | re.IGNORECASE)
-    # Step 2: Remove <font> tags but keep inner text
     text = re.sub(r'<font\s[^>]*>(.*?)</font>', r'\1', text, flags=re.DOTALL | re.IGNORECASE)
-    # Step 3: Remove ALL remaining HTML tags (including self-closing, broken, partial)
+    text = re.sub(r'<script[^>]*>.*?</script>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'<[^>]*>', ' ', text)
-    # Step 4: Remove broken tag fragments like 'a target="_blank"', 'font color="..."'
     text = re.sub(r'\ba\s+target="[^"]*"', '', text)
     text = re.sub(r'\bfont\s+color="[^"]*"', '', text)
     text = re.sub(r'\btarget="[^"]*"', '', text)
     text = re.sub(r'\bhref="[^"]*"', '', text)
-    # Step 5: Remove HTML entities
     text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     text = re.sub(r'&[a-zA-Z]+;', ' ', text)
     text = re.sub(r'&#\d+;', ' ', text)
     text = unescape(text)
-    # Step 6: Remove raw URLs
     text = re.sub(r'https?://\S+', '', text)
-    # Step 7: Remove any leftover angle brackets or tag-like junk
     text = re.sub(r'[<>]', '', text)
     text = re.sub(r'/font\b', '', text)
     text = re.sub(r'/a\b', '', text)
-    # Step 8: Collapse whitespace
     text = re.sub(r'\s+', ' ', text).strip()
-    return text[:250]
+    return text
 
 
 def extract_cdata(xml_str: str, tag: str) -> str:
@@ -92,7 +105,35 @@ def resolve_article_url(title: str, hostname: str) -> str:
     return f'https://www.google.com/search?q={quote(clean_title)}'
 
 
-# ── Search Queries ──
+def extract_article_text(url: str) -> str:
+    """Scrape readable text from an article URL. Best-effort."""
+    html = fetch_url(url, timeout=10)
+    if not html:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer", "aside"]):
+            tag.decompose()
+        # Prefer <article> or main <p> paragraphs
+        article = soup.find("article")
+        if article:
+            paragraphs = article.find_all("p")
+        else:
+            paragraphs = soup.find_all("p")
+        text = "\n\n".join(p.get_text(" ", strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 40)
+        if len(text) < 200:
+            # Fallback: get all visible text
+            text = soup.get_text(" ", strip=True)
+        return clean_html(text)[:8000]
+    except Exception as e:
+        print(f"[extract_article_text] {e}")
+        return clean_html(html)[:8000]
+
+
+# ══════════════════════════════════════
+# Search Queries + Scoring
+# ══════════════════════════════════════
 
 QUERIES = [
     # Equity
@@ -130,77 +171,183 @@ SCORING_WEIGHTS = {
     "publications": {"label": "Publications", "weight": 1, "color": "#666"},
 }
 
-# ── Platform Prompts ──
 
-PREAMBLE = 'You are a professional finance content writer for "Bytes News" — an Indian finance media brand. Your audience is Indian retail investors aged 22-40.'
+# ══════════════════════════════════════
+# Job Pipeline (in-memory)
+# ══════════════════════════════════════
 
-PLATFORM_PROMPTS = {
-    "instagram-reel": f"""{PREAMBLE}
+@dataclass
+class PipelineStep:
+    name: str
+    label: str
+    status: str = "pending"  # pending | running | done | failed
+    progress: int = 0  # 0-100
+    eta_seconds: int = 0
+    message: str = ""
+    started_at: Optional[float] = None
+    ended_at: Optional[float] = None
 
-Write a voiceover script for an Instagram Reel (40 seconds).
-RULES:
-- EXACTLY 100-120 words. Open with a punchy hook.
-- Cover 2-3 KEY facts with specific numbers (₹, Sensex, Nifty, crore, lakh)
-- Explain WHY this matters. End with a forward-looking statement.
-- Tone: confident, clear, slightly urgent. NO stage directions, NO greetings, NO emojis.
-- ONLY spoken words. Return ONLY the script text.""",
 
-    "youtube-short": f"""{PREAMBLE}
+@dataclass
+class PipelineJob:
+    id: str
+    created_at: float
+    category: str
+    script: str
+    avatar_id: str
+    voice_id: str
+    article_title: str = ""
+    status: str = "running"  # running | done | failed
+    error: Optional[str] = None
+    heygen_video_id: Optional[str] = None
+    artifacts: dict = field(default_factory=dict)  # {storyboard_pdf, video_mp4}
+    steps: list = field(default_factory=list)
 
-Write a voiceover script for a YouTube Short (60 seconds).
-RULES:
-- EXACTLY 150-170 words. Open with a compelling hook.
-- Cover 3-4 key facts. Add one expert-level insight.
-- End with engagement CTA. NO stage directions, NO emojis. ONLY spoken words.
-Return ONLY the script text.""",
 
-    "tiktok": f"""{PREAMBLE}
+jobs: dict[str, PipelineJob] = {}
+jobs_lock = threading.Lock()
 
-Write a voiceover script for TikTok (30 seconds).
-RULES:
-- EXACTLY 75-90 words. First sentence MUST be a scroll-stopper.
-- Max 2 key facts. Use "you/your" heavily. Casual, punchy, short sentences.
-- End with a hot take or question. ONLY spoken words.
-Return ONLY the script text.""",
 
-    "instagram-carousel": f"""{PREAMBLE}
+def update_step(job: PipelineJob, step_name: str, **updates):
+    """Thread-safe step update."""
+    with jobs_lock:
+        for step in job.steps:
+            if step.name == step_name:
+                for k, v in updates.items():
+                    setattr(step, k, v)
+                return
 
-Create an Instagram carousel (8-10 slides).
-RULES:
-- Slide 1: Bold hook headline only (max 8 words)
-- Slides 2-8: header (3-5 words) and body (15-25 words)
-- Slide 9: Key takeaway. Slide 10: CTA.
-- Use specific numbers. NO emojis in headers.
-Return ONLY valid JSON: array of {{"slideNumber": number, "header": string, "body": string}}""",
 
-    "linkedin-carousel": f"""{PREAMBLE}
+def run_visuals_and_pdf(job: PipelineJob):
+    """Thread 1: generate visual JSON → render PDF."""
+    try:
+        # Step: visuals
+        update_step(job, "visuals", status="running", started_at=time.time(), progress=10, message="Generating shot breakdown...")
+        visuals = sb.generate_visuals(job.script, job.category)
+        if not visuals:
+            raise RuntimeError("Visual generator returned empty JSON")
+        update_step(job, "visuals", status="done", progress=100, ended_at=time.time(),
+                    message=f"Generated {len(visuals)} shots")
 
-Create a LinkedIn carousel (8-10 slides).
-RULES:
-- Slide 1: Professional headline. Slides 2-8: header (3-6 words) and body (20-35 words) with data.
-- Slide 9: Strategic implications. Slide 10: Professional CTA.
-- Use industry terminology.
-Return ONLY valid JSON: array of {{"slideNumber": number, "header": string, "body": string}}""",
+        # Step: storyboard_pdf
+        update_step(job, "storyboard_pdf", status="running", started_at=time.time(), progress=20, message="Rendering PDF...")
+        title = f"A1 Bytes — {CATEGORY_LABELS.get(job.category, job.category.title())}"
+        if job.article_title:
+            title = f"A1 Bytes — {job.article_title[:60]}"
+        pdf_buffer = sb.render_storyboard_pdf(visuals, job.script, title)
 
-    "youtube-longform": f"""{PREAMBLE}
+        pdf_path = os.path.join(STORYBOARDS_DIR, f"{job.id}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_buffer.getvalue())
 
-Write a YouTube long-form script (3-5 minutes).
-RULES:
-- EXACTLY 500-700 words. Structure: [INTRO] ~60w, [WHAT HAPPENED] ~120w, [WHY IT MATTERS] ~120w, [DEEPER ANALYSIS] ~120w, [WHAT TO WATCH] ~80w, [OUTRO] ~50w
-- Include specific numbers. Tone: like a market analyst on YouTube.
-- ONLY spoken words with section headers.
-Return ONLY the script text.""",
-}
+        with jobs_lock:
+            job.artifacts["storyboard_pdf"] = pdf_path
+        update_step(job, "storyboard_pdf", status="done", progress=100, ended_at=time.time(),
+                    message="Storyboard PDF ready")
+    except Exception as e:
+        print(f"[Pipeline {job.id}] visuals/pdf error: {e}")
+        update_step(job, "visuals", status="failed", message=str(e)[:120])
+        update_step(job, "storyboard_pdf", status="failed", message="Skipped due to earlier error")
+
+
+def run_heygen(job: PipelineJob):
+    """Thread 2: submit to HeyGen → poll → download."""
+    try:
+        # Step: heygen_submit
+        update_step(job, "heygen_submit", status="running", started_at=time.time(), progress=20,
+                    message="Submitting script to HeyGen...")
+        video_id = hg.submit_video(job.script, job.avatar_id, job.voice_id)
+        job.heygen_video_id = video_id
+        update_step(job, "heygen_submit", status="done", progress=100, ended_at=time.time(),
+                    message=f"Submitted (video_id: {video_id[:10]}...)")
+
+        # Step: heygen_poll — poll every 15s, updating progress
+        update_step(job, "heygen_poll", status="running", started_at=time.time(), progress=0,
+                    message="Waiting for HeyGen to render video...", eta_seconds=600)
+
+        start = time.time()
+        max_wait = 20 * 60  # 20 minutes
+        while True:
+            elapsed = time.time() - start
+            if elapsed > max_wait:
+                raise TimeoutError("HeyGen rendering timed out after 20 minutes")
+
+            info = hg.poll_video(video_id)
+            status = info.get("status", "unknown")
+            video_url = info.get("video_url")
+
+            # Estimate progress: HeyGen typically takes 5-10 min, cap at 90% until complete
+            progress = min(90, int((elapsed / 600) * 90))
+            eta = max(60, int(600 - elapsed))
+            update_step(job, "heygen_poll", progress=progress, eta_seconds=eta,
+                        message=f"Status: {status} ({int(elapsed)}s elapsed)")
+
+            if status == "completed" and video_url:
+                update_step(job, "heygen_poll", progress=95, message="Downloading video...")
+                mp4_path = os.path.join(VIDEOS_DIR, f"{job.id}.mp4")
+                hg.download_video(video_url, mp4_path)
+                with jobs_lock:
+                    job.artifacts["video_mp4"] = mp4_path
+                update_step(job, "heygen_poll", status="done", progress=100, ended_at=time.time(),
+                            message="Video downloaded")
+                return
+
+            if status == "failed":
+                raise RuntimeError(f"HeyGen failed: {info.get('error', 'unknown error')}")
+
+            time.sleep(15)
+    except Exception as e:
+        print(f"[Pipeline {job.id}] heygen error: {e}")
+        update_step(job, "heygen_submit", status="failed" if job.heygen_video_id is None else "done",
+                    message=str(e)[:120])
+        update_step(job, "heygen_poll", status="failed", message=str(e)[:120])
+
+
+def run_pipeline(job: PipelineJob):
+    """Run the two parallel threads and mark job complete."""
+    t1 = threading.Thread(target=run_visuals_and_pdf, args=(job,), daemon=True)
+    t2 = threading.Thread(target=run_heygen, args=(job,), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Finalize
+    any_failed = any(s.status == "failed" for s in job.steps)
+    with jobs_lock:
+        job.status = "failed" if any_failed else "done"
+
+
+def serialize_job(job: PipelineJob) -> dict:
+    with jobs_lock:
+        return {
+            "id": job.id,
+            "created_at": job.created_at,
+            "category": job.category,
+            "article_title": job.article_title,
+            "status": job.status,
+            "error": job.error,
+            "heygen_video_id": job.heygen_video_id,
+            "artifacts": {
+                "storyboard_pdf": bool(job.artifacts.get("storyboard_pdf")),
+                "video_mp4": bool(job.artifacts.get("video_mp4")),
+            },
+            "steps": [asdict(s) for s in job.steps],
+        }
 
 
 # ══════════════════════════════════════
-# ROUTES
+# ROUTES — static SPA
 # ══════════════════════════════════════
 
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
 
+
+# ══════════════════════════════════════
+# ROUTES — Topics (Quick Scan)
+# ══════════════════════════════════════
 
 @app.route("/api/topics")
 def get_topics():
@@ -216,7 +363,6 @@ def get_topics():
         if not xml:
             continue
 
-        # Parse first <item>
         m = re.search(r"<item>(.*?)</item>", xml, re.DOTALL)
         if not m:
             continue
@@ -226,13 +372,11 @@ def get_topics():
         if not title:
             continue
 
-        # Dedup by first 4 words
         title_key = " ".join(title.lower().split()[:4])
         if title_key in seen:
             continue
         seen.add(title_key)
 
-        # Check age
         pub_date = extract_cdata(item_xml, "pubDate")
         if pub_date:
             try:
@@ -244,7 +388,6 @@ def get_topics():
             except Exception:
                 pass
 
-        # Source info
         source_name = extract_cdata(item_xml, "source")
         src_url_m = re.search(r'<source\s+url="([^"]+)"', item_xml)
         hostname = ""
@@ -255,7 +398,7 @@ def get_topics():
                 pass
 
         description = extract_cdata(item_xml, "description")
-        summary = clean_html(description) or f"Latest news on {q['label']}"
+        summary = clean_html(description)[:250] or f"Latest news on {q['label']}"
         article_url = resolve_article_url(title, hostname)
 
         topics.append({
@@ -301,7 +444,6 @@ Return ONLY a JSON array of strings, one per topic. No explanation.
 
 Topics:
 {topic_lines}"""
-
             headlines_raw = call_claude(prompt, 800)
             json_match = re.search(r"\[[\s\S]*\]", headlines_raw)
             if json_match:
@@ -318,111 +460,311 @@ Topics:
     })
 
 
+# ══════════════════════════════════════
+# ROUTES — Manual Input
+# ══════════════════════════════════════
+
+@app.route("/api/manual-input", methods=["POST"])
+def manual_input():
+    """
+    Accept manual article input: URL + optional fallback text.
+    Returns a normalized topic object ready for script generation.
+    """
+    data = request.json or {}
+    article_url = (data.get("articleUrl") or "").strip()
+    article_title = (data.get("articleTitle") or "").strip()
+    fallback_text = (data.get("fallbackText") or "").strip()
+
+    article_text = ""
+    resolved_title = article_title
+
+    # Try URL extraction first
+    if article_url:
+        extracted = extract_article_text(article_url)
+        if extracted and len(extracted) > 200:
+            article_text = extracted
+            if not resolved_title:
+                # Try to grab title from page <title>
+                html = fetch_url(article_url, timeout=8)
+                tm = re.search(r"<title[^>]*>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
+                if tm:
+                    resolved_title = clean_html(tm.group(1))[:200]
+
+    # Fall back to user-provided text
+    if len(article_text) < 200 and fallback_text:
+        article_text = fallback_text
+
+    if not article_text:
+        return jsonify({"error": "Could not extract article content. Provide fallback text."}), 400
+
+    if not resolved_title:
+        resolved_title = article_text[:80] + "..."
+
+    summary = (article_text[:240] + "...") if len(article_text) > 240 else article_text
+
+    # Auto-detect category so the UI can pre-select it
+    category_key = "stock"
+    try:
+        category_key = sb.detect_category(resolved_title, article_text)
+    except Exception as e:
+        print(f"[manual-input] category detection failed: {e}")
+
+    topic = {
+        "id": f"manual-{uuid.uuid4().hex[:8]}",
+        "keyword": CATEGORY_LABELS.get(category_key, "Custom"),
+        "headline": resolved_title,
+        "articleUrl": article_url,
+        "articleTitle": resolved_title,
+        "articleSummary": summary,
+        "articleText": article_text,  # full text for script generation
+        "category": category_key,
+        "score": 0,
+        "articles": [{"url": article_url, "sourceName": "Manual Input", "title": resolved_title}] if article_url else [],
+        "tweets": [],
+        "sources": {
+            "googleTrends": False,
+            "twitter": {"tier1Count": 0, "tier1Handles": [], "tier2Count": 0, "tier2Handles": []},
+            "reddit": {"count": 0, "score": 0, "subreddits": []},
+            "publications": {"count": 0, "names": []},
+        },
+    }
+    return jsonify({"topic": topic, "detectedCategory": category_key})
+
+
+# ══════════════════════════════════════
+# ROUTES — Scripts (A1 Bytes framework)
+# ══════════════════════════════════════
+
 @app.route("/api/scripts/generate", methods=["POST"])
 def generate_scripts():
+    """
+    Generate structured A1 Bytes scripts for 1-5 topics.
+    Request: {topics: [...], category?: string}  (category=null → auto-detect per topic)
+    """
     data = request.json or {}
     topics_list = data.get("topics", [])
-    platform = data.get("platform", "instagram-reel")
+    forced_category = data.get("category")  # null/undefined = auto-detect
 
-    if not topics_list or not platform:
-        return jsonify({"error": "topics and platform are required"}), 400
+    if not topics_list:
+        return jsonify({"error": "topics are required"}), 400
     if len(topics_list) > 5:
         return jsonify({"error": "Maximum 5 topics at a time"}), 400
 
-    prompt_template = PLATFORM_PROMPTS.get(platform, PLATFORM_PROMPTS["instagram-reel"])
-    is_carousel = platform in ("instagram-carousel", "linkedin-carousel")
-
     scripts = []
     for topic in topics_list:
-        article_text = topic.get("articleSummary", "")
+        article_text = topic.get("articleText") or topic.get("articleSummary", "")
         article_title = topic.get("articleTitle", topic.get("keyword", ""))
 
-        prompt = f"""{prompt_template}
+        # Resolve category
+        category = forced_category or topic.get("category")
+        if not category or category not in CATEGORY_PATTERNS:
+            try:
+                category = sb.detect_category(article_title, article_text)
+            except Exception as e:
+                print(f"[scripts] detect_category failed: {e}")
+                category = "stock"
 
-NEWS ARTICLE:
-Title: {article_title}
-Content: {article_text[:3000]}"""
+        # Compose the "raw script" the structurer wants: title + article text
+        raw_input = f"Headline: {article_title}\n\n{article_text}"
 
-        result = call_claude(prompt, 1500)
+        try:
+            structured = sb.structure_script(raw_input, category)
+        except Exception as e:
+            print(f"[scripts] structure_script error: {e}")
+            structured = f"[Avatar] Script generation failed: {e}"
 
+        wc = len(structured.split())
+        secs = round(wc / 2.5)
         script_obj = {
             "id": str(uuid.uuid4()),
             "topicId": topic.get("id", ""),
             "keyword": topic.get("keyword", ""),
             "articleTitle": article_title,
-            "platform": platform,
+            "category": category,
+            "categoryLabel": CATEGORY_LABELS.get(category, category.title()),
+            "categoryIcon": CATEGORY_ICONS.get(category, "📰"),
+            "script": structured,
+            "wordCount": wc,
+            "estimatedDuration": f"{secs // 60}:{secs % 60:02d}",
             "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "revisions": [],
         }
-
-        if is_carousel:
-            json_match = re.search(r"\[[\s\S]*\]", result)
-            if json_match:
-                slides = json.loads(json_match.group(0))
-                script_obj["slides"] = slides
-                script_obj["wordCount"] = sum(
-                    len((s.get("header", "") + " " + s.get("body", "")).split()) for s in slides
-                )
-            else:
-                script_obj["script"] = result.strip()
-                script_obj["wordCount"] = len(result.split())
-        else:
-            script_obj["script"] = result.strip()
-            wc = len(result.split())
-            script_obj["wordCount"] = wc
-            secs = round(wc / 2.5)
-            script_obj["estimatedDuration"] = f"{secs // 60}:{secs % 60:02d}"
-
         scripts.append(script_obj)
 
     return jsonify({"scripts": scripts})
 
 
 @app.route("/api/scripts/revise", methods=["POST"])
-def revise_script():
+def revise_script_route():
+    """Revise a structured script based on user feedback, keeping category pattern."""
     data = request.json or {}
     feedback = data.get("feedback", "")
     current_script = data.get("currentScript", "")
-    current_slides = data.get("currentSlides")
-    platform = data.get("platform", "instagram-reel")
-    article_title = data.get("articleTitle", "")
+    category = data.get("category", "stock")
 
-    if not feedback:
-        return jsonify({"error": "feedback is required"}), 400
+    if not feedback or not current_script:
+        return jsonify({"error": "feedback and currentScript are required"}), 400
 
-    is_carousel = platform in ("instagram-carousel", "linkedin-carousel")
-    current_content = json.dumps(current_slides, indent=2) if is_carousel else current_script
+    if category not in CATEGORY_PATTERNS:
+        category = "stock"
 
-    prompt = f"""Revise this {platform} content based on user feedback. Keep the same format and word count requirements.
+    try:
+        revised = sb.revise_structured_script(current_script, feedback, category)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-CURRENT VERSION:
-{current_content}
+    wc = len(revised.split())
+    return jsonify({
+        "revision": {
+            "feedback": feedback,
+            "script": revised,
+            "wordCount": wc,
+            "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    })
 
-USER FEEDBACK:
-{feedback}
 
-NEWS TOPIC: {article_title}
+# ══════════════════════════════════════
+# ROUTES — HeyGen metadata
+# ══════════════════════════════════════
 
-Return ONLY the revised content in the exact same format."""
+@app.route("/api/heygen/avatars")
+def get_heygen_avatars():
+    try:
+        avatars = hg.list_avatars()
+        # Return trimmed fields
+        simplified = [
+            {
+                "avatar_id": a.get("avatar_id"),
+                "avatar_name": a.get("avatar_name"),
+                "gender": a.get("gender"),
+                "preview_image_url": a.get("preview_image_url"),
+                "preview_video_url": a.get("preview_video_url"),
+            }
+            for a in avatars
+            if a.get("avatar_id")
+        ]
+        return jsonify({"avatars": simplified})
+    except requests.HTTPError as e:
+        return jsonify({"error": f"HeyGen API error: {e.response.status_code}", "avatars": []}), 502
+    except Exception as e:
+        return jsonify({"error": str(e), "avatars": []}), 500
 
-    result = call_claude(prompt, 1500)
 
-    revision = {"feedback": feedback, "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+@app.route("/api/heygen/voices")
+def get_heygen_voices():
+    try:
+        voices = hg.list_voices()
+        simplified = [
+            {
+                "voice_id": v.get("voice_id"),
+                "name": v.get("name"),
+                "language": v.get("language"),
+                "gender": v.get("gender"),
+                "preview_audio": v.get("preview_audio"),
+            }
+            for v in voices
+            if v.get("voice_id")
+        ]
+        return jsonify({"voices": simplified})
+    except Exception as e:
+        return jsonify({"error": str(e), "voices": []}), 500
 
-    if is_carousel:
-        json_match = re.search(r"\[[\s\S]*\]", result)
-        if json_match:
-            slides = json.loads(json_match.group(0))
-            revision["slides"] = slides
-            revision["wordCount"] = sum(
-                len((s.get("header", "") + " " + s.get("body", "")).split()) for s in slides
-            )
-    else:
-        revision["script"] = result.strip()
-        revision["wordCount"] = len(result.split())
 
-    return jsonify({"revision": revision})
+# ══════════════════════════════════════
+# ROUTES — Pipeline
+# ══════════════════════════════════════
 
+@app.route("/api/pipeline/start", methods=["POST"])
+def start_pipeline():
+    """
+    Start the full Storyboard + HeyGen pipeline.
+    Request: {script, category, avatar_id, voice_id, article_title?}
+    """
+    data = request.json or {}
+    script = data.get("script", "").strip()
+    category = data.get("category", "stock")
+    avatar_id = data.get("avatar_id", "").strip()
+    voice_id = data.get("voice_id", "").strip()
+    article_title = data.get("articleTitle", "").strip()
+
+    if not script:
+        return jsonify({"error": "script is required"}), 400
+    if not avatar_id:
+        return jsonify({"error": "avatar_id is required"}), 400
+    if not voice_id:
+        return jsonify({"error": "voice_id is required"}), 400
+    if not os.environ.get("HEYGEN_API_KEY"):
+        return jsonify({"error": "HEYGEN_API_KEY not configured on server"}), 500
+
+    job_id = f"job-{uuid.uuid4().hex[:10]}"
+    steps = [
+        PipelineStep(name="visuals", label="Generate shot breakdown"),
+        PipelineStep(name="storyboard_pdf", label="Render storyboard PDF"),
+        PipelineStep(name="heygen_submit", label="Submit to HeyGen"),
+        PipelineStep(name="heygen_poll", label="Wait for video render"),
+    ]
+    job = PipelineJob(
+        id=job_id,
+        created_at=time.time(),
+        category=category,
+        script=script,
+        avatar_id=avatar_id,
+        voice_id=voice_id,
+        article_title=article_title,
+        steps=steps,
+    )
+    with jobs_lock:
+        jobs[job_id] = job
+
+    # Fire-and-forget pipeline thread
+    threading.Thread(target=run_pipeline, args=(job,), daemon=True).start()
+
+    return jsonify({"job_id": job_id, "job": serialize_job(job)})
+
+
+@app.route("/api/pipeline/<job_id>/status")
+def pipeline_status(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify({"job": serialize_job(job)})
+
+
+@app.route("/api/pipeline/<job_id>/download/<artifact>")
+def pipeline_download(job_id: str, artifact: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+
+    if artifact == "storyboard":
+        path = job.artifacts.get("storyboard_pdf")
+        if not path or not os.path.exists(path):
+            return jsonify({"error": "storyboard not ready"}), 404
+        return send_file(path, as_attachment=True, download_name=f"bytes-storyboard-{job_id}.pdf")
+
+    if artifact == "video":
+        path = job.artifacts.get("video_mp4")
+        if not path or not os.path.exists(path):
+            return jsonify({"error": "video not ready"}), 404
+        return send_file(path, as_attachment=True, download_name=f"bytes-video-{job_id}.mp4")
+
+    return jsonify({"error": "unknown artifact"}), 400
+
+
+@app.route("/api/pipeline/list")
+def pipeline_list():
+    """List all jobs (sorted newest first)."""
+    with jobs_lock:
+        all_jobs = sorted(jobs.values(), key=lambda j: j.created_at, reverse=True)
+    return jsonify({"jobs": [serialize_job(j) for j in all_jobs[:50]]})
+
+
+# ══════════════════════════════════════
+# ROUTES — Settings
+# ══════════════════════════════════════
 
 @app.route("/api/settings", methods=["GET", "POST"])
 def settings():
@@ -436,7 +778,11 @@ def settings():
             client = anthropic.Anthropic(api_key=API_KEY)
             return jsonify({"status": "ok", "message": "API key updated"})
         return jsonify({"error": "apiKey is required"}), 400
-    return jsonify({"hasKey": bool(API_KEY), "isDefault": API_KEY == DEFAULT_API_KEY})
+    return jsonify({
+        "hasKey": bool(API_KEY),
+        "isDefault": API_KEY == DEFAULT_API_KEY,
+        "hasHeyGenKey": bool(os.environ.get("HEYGEN_API_KEY")),
+    })
 
 
 # Serve React SPA for all non-API routes
@@ -451,6 +797,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     print(f"\n  Bytes ScriptGen running at http://localhost:{port}")
     print(f"  Open this URL in your browser\n")
-    import webbrowser
-    webbrowser.open(f"http://localhost:{port}")
+    try:
+        import webbrowser
+        webbrowser.open(f"http://localhost:{port}")
+    except Exception:
+        pass
     app.run(host="0.0.0.0", port=port, debug=False)
